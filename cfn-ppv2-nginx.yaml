@@ -1,0 +1,424 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description:  Blog post - Preserving Client IP Address with Proxy Protocol v2 and Network Load Balancer (NGINX)
+
+Parameters:
+  ClientCIDR:
+    Description: Please enter the IP range (CIDR notation) from which you will access the web server
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: Must be a valid IP CIDR range of the form x.x.x.x/x.
+    MaxLength: 18
+    MinLength: 9
+
+  LatestAmiId:
+    Description: The ID of the AMI
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+  EnvironmentName:
+    Description: An environment name that is prefixed to resource names
+    Type: String
+    Default: ppv2-demo
+
+  VpcCIDR:
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: Must be a valid IP CIDR range of the form x.x.x.x/x.
+    MaxLength: 18
+    MinLength: 9
+
+  PublicSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 10.0.2.0/24
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: Must be a valid IP CIDR range of the form x.x.x.x/x.
+    MaxLength: 18
+    MinLength: 9
+
+  PrivateSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the first Availability Zone
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: Must be a valid IP CIDR range of the form x.x.x.x/x.
+    MaxLength: 18
+    MinLength: 9
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet (AZ1)
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet (AZ1)
+
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Routes
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Routes (AZ1)
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-ec2-sg
+      GroupDescription: Security group for targets of the NLB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        SourceSecurityGroupId: !Ref NLBSecurityGroup
+        Description: Allow HTTP from NLB
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+        Description: Allow all outbound traffic by default
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      RoleName: !Sub ${EnvironmentName}-ec2-role
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+      InstanceProfileName: !Sub ${EnvironmentName}-ec2-profile
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: NatGateway1
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              nginx: []
+              php8.2-fpm: []
+              wireshark-cli: []
+          services:
+            systemd:
+              nginx:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - "/etc/nginx/nginx.conf"
+                  - "/usr/share/nginx/html/index.php"
+              php-fpm:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - "/etc/php-fpm.d/www.conf"
+          files:
+            /etc/nginx/nginx.conf:
+              content: !Sub |
+                user nginx;
+                worker_processes auto;
+                error_log /var/log/nginx/error.log notice;
+                pid /run/nginx.pid;
+
+                # Load dynamic modules. See /usr/share/doc/nginx/README.dynamic.
+                include /usr/share/nginx/modules/*.conf;
+
+                events {
+                  worker_connections 1024;
+                }
+
+                http {
+                  log_format  main  '$proxy_protocol_addr - $remote_user [$time_local] "$request" '
+                                    '$status $body_bytes_sent "$http_referer" '
+                                    '"$http_user_agent" "$http_x_forwarded_for"';
+                  access_log  /var/log/nginx/access.log  main;
+                  sendfile            on;
+                  tcp_nopush          on;
+                  keepalive_timeout   65;
+                  types_hash_max_size 4096;
+                  include             /etc/nginx/mime.types;
+                  default_type        application/octet-stream;
+                  include /etc/nginx/conf.d/*.conf;
+
+                  server {
+                    listen       80 proxy_protocol;
+                    server_name  _;
+                    root         /usr/share/nginx/html;
+
+                    location / {
+                    index index.php;
+                    }
+
+                    location ~ [^/]\.php(/|$) {
+                    fastcgi_split_path_info ^(.+?\.php)(/.*)$;
+                    if (!-f $document_root$fastcgi_script_name) {
+                        return 404;
+                    }
+                    fastcgi_param HTTP_PROXY "";
+                    fastcgi_param CLIENT_ADDR $proxy_protocol_addr;
+                    fastcgi_param CLIENT_PORT $proxy_protocol_port;
+                    fastcgi_pass 127.0.0.1:9000;
+                    fastcgi_index index.php;
+                    include fastcgi_params;
+                    fastcgi_param  SCRIPT_FILENAME   $document_root$fastcgi_script_name;
+                    }
+
+                    error_page 404 /404.html;
+                    location = /404.html {
+                    }
+
+                    error_page 500 502 503 504 /50x.html;
+                    location = /50x.html {
+                    }
+                  }
+                }
+              mode: '000644'
+              owner: 'nginx'
+              group: 'nginx'
+            /etc/php-fpm.d/www.conf:
+              content: !Sub |
+                [www]
+                user = nginx
+                group = nginx
+                listen = 127.0.0.1:9000
+                listen.allowed_clients = 127.0.0.1
+                listen.owner = nginx
+                listen.group = nginx
+                pm = dynamic
+                pm.max_children = 5
+                pm.start_servers = 2
+                pm.min_spare_servers = 1
+                pm.max_spare_servers = 3
+                pm.max_requests = 500
+              mode: '000644'
+              owner: 'nginx'
+              group: 'nginx'
+            /usr/share/nginx/html/index.php:
+              content: !Sub |
+                <!DOCTYPE html>
+                <html>
+                <head>
+                  <style>
+                  table {
+                    border-collapse: collapse;
+                  }
+
+                  td, th {
+                    border: 1px solid #ddd;
+                    padding: 8px;
+                  }
+
+                  tr:nth-child(even) {
+                    background-color: #f2f2f2;
+                  }
+                  </style>
+                </head>
+                <body>
+                <table>
+                <caption style="font-weight: bold;">Connection Details</caption>
+                <?php
+                  echo "<tr>";
+                  echo "<td>Client Source IP (from PPv2 header)</td>";
+                  echo "<td>" . $_SERVER['CLIENT_ADDR']. "</td>";
+                  echo "</tr>";
+                  echo "<tr>";
+                  echo "<td>Client Source Port (from PPv2 header)</td>";
+                  echo "<td>" . $_SERVER['CLIENT_PORT']. "</td>";
+                  echo "</tr>";
+                  echo "<tr>";
+                  echo "<td>Client Software</td>";
+                  echo "<td>" . $_SERVER['HTTP_USER_AGENT']. "</td>";
+                  echo "</tr>";
+                  echo "<tr>";
+                  echo "<td>Server Software</td>";
+                  echo "<td>" . $_SERVER['SERVER_SOFTWARE']. "</td>";
+                  echo "</tr>";
+                ?>
+                </table>
+                </body>
+                </html>
+              mode: '000644'
+              owner: 'nginx'
+              group: 'nginx'
+    Properties:
+      InstanceType: "t2.micro"
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      SubnetId: !Ref PrivateSubnet1
+      UserData:
+        Fn::Base64: 
+          !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y aws-cfn-bootstrap
+          sleep 30
+          /opt/aws/bin/cfn-init -v -s ${AWS::StackName} -r EC2Instance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ec2-instance
+
+  NLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: "internet-facing"
+      Subnets:
+        - !Ref PublicSubnet1
+      SecurityGroups:
+        - !Ref NLBSecurityGroup
+      Type: "network"
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nlb
+      
+  NLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: "forward"
+          TargetGroupArn: !Ref NLBTargetGroup
+      LoadBalancerArn: !Ref NLB
+      Port: 80
+      Protocol: "TCP"
+
+  NLBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: "TCP"
+      VpcId: !Ref VPC
+      HealthCheckProtocol: "HTTP"
+      TargetType: "ip"
+      TargetGroupAttributes:
+        - Key: proxy_protocol_v2.enabled
+          Value: true
+      Targets:
+        - Id: !GetAtt EC2Instance.PrivateIp
+          Port: 80
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nlb-tg
+  
+  NLBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-nlb-sg
+      GroupDescription: Security group for NLB with ingress rule for HTTP from ClientCIDR
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: !Ref ClientCIDR
+        Description: Allow HTTP from ClientCIDR
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+        Description: Allow all outbound traffic by default
+          
+Outputs:
+  URL:
+    Description: The URL of the website for testing
+    Value: !Join ['', ['http://', !GetAtt NLB.DNSName, '/index.php']]

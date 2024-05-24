@@ -1,11 +1,8 @@
 ## Preserving Client IP Address with Proxy Protocol v2 and Network Load Balancer
 
-TODO: Fill this README out!
+Deploy the CloudFormation template of your choice, either NGINX or HAproxy. The template will deploy the following infrastructure:
 
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+![Infrastructure deployed by CloudFormation template](cfn-ppv2-diagram.png)
 
 ## Security
 
